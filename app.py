@@ -370,7 +370,7 @@ def main():
             else:
                 st.markdown(f"### {x.get('title',ticker)} · {ticker}")
                 m=st.columns(6)
-                vals=[("Price",fmt(x["price"])),("RSI",fmt(x["rsi"])),("Split",x["ratio"]),("Split date",x["split_date"].date() if pd.notna(x["split_date"]) else "—"),("Drop",fmt(x["drop"],"%")),("Shares Δ",fmt(x["share_change"].get("change_pct"),"%"))]
+                vals=[("Price",fmt(x["price"])),("RSI",fmt(x["rsi"])),("Split",x["ratio"]),("Split date",x["split_date"].strftime("%Y-%m-%d") if pd.notna(x["split_date"]) else "—"),("Drop",fmt(x["drop"],"%")),("Shares Δ",fmt(x["share_change"].get("change_pct"),"%"))]
                 for col,(lab,val) in zip(m,vals): col.metric(lab,val)
                 st.markdown("#### Last 30 trading days")
                 p=yahoo_chart(ticker,"2y")["df"].tail(30).sort_values("date",ascending=False).copy()
