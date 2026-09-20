@@ -186,22 +186,50 @@ def shares_change(ticker):
 
 @st.cache_data(ttl=900, max_entries=2000)
 def iborrow(ticker):
+    empty = pd.DataFrame(columns=["reported","fee","available"])
+    url = IBD.format(ticker=ticker.upper())
+    browser_headers = {**HEADERS, "User-Agent":"Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1", "Referer":url}
     try:
-        r = requests.get(IBD.format(ticker=ticker), headers={**HEADERS,"User-Agent":"Mozilla/5.0 Chrome/128"}, timeout=12)
+        r = requests.get(url, headers=browser_headers, timeout=12)
         r.raise_for_status()
-        tables = pd.read_html(r.text)
+        html = r.text
+        # The public page is sometimes rendered without a normal HTML table.
+        # Prefer read_html when available, then fall back to the visible row pattern.
+        try:
+            tables = pd.read_html(html)
+        except Exception:
+            tables = []
         for t in tables:
-            cols = {str(c).lower():c for c in t.columns}
+            cols = {str(c).strip().lower():c for c in t.columns}
             rep = next((c for k,c in cols.items() if "reported" in k),None)
             fee = next((c for k,c in cols.items() if "fee" in k),None)
             avail = next((c for k,c in cols.items() if "available" in k),None)
-            if rep and fee and avail:
-                out = pd.DataFrame({"reported":pd.to_datetime(t[rep],errors="coerce"),"fee":t[fee].map(num),"available":t[avail].map(human_num)})
+            if rep is not None and fee is not None and avail is not None:
+                out = pd.DataFrame({"reported":pd.to_datetime(t[rep],errors="coerce"),
+                                    "fee":t[fee].map(num),"available":t[avail].map(human_num)})
                 out = out.dropna(subset=["reported"]).sort_values("reported")
-                return {"status":STATUS_OK,"error":"","df":out.tail(31)}
+                if not out.empty:
+                    return {"status":STATUS_OK,"error":"","df":out.tail(31)}
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
+        pattern = re.compile(
+            r"([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}\s+(?:AM|PM))"
+            r"\s+([-+]?\d+(?:\.\d+)?)\s*%\s+([0-9.,]+(?:[KMBT])?)",
+            re.I,
+        )
+        rows = []
+        for m in pattern.finditer(text):
+            dt = pd.to_datetime(m.group(1), errors="coerce")
+            fee_v = num(m.group(2))
+            avail_v = human_num(m.group(3))
+            if pd.notna(dt) and np.isfinite(fee_v) and np.isfinite(avail_v):
+                rows.append({"reported":dt,"fee":fee_v,"available":avail_v})
+        if rows:
+            out = pd.DataFrame(rows).drop_duplicates("reported").sort_values("reported")
+            return {"status":STATUS_OK,"error":"","df":out.tail(31).reset_index(drop=True)}
+        return {"status":STATUS_UNKNOWN,"error":"IBorrowDesk page returned no readable history","df":empty}
     except Exception as e:
-        return {"status":STATUS_UNKNOWN,"error":str(e),"df":pd.DataFrame(columns=["reported","fee","available"])}
-    return {"status":STATUS_UNKNOWN,"error":"No readable table","df":pd.DataFrame(columns=["reported","fee","available"])}
+        return {"status":STATUS_UNKNOWN,"error":str(e),"df":empty}
 
 @st.cache_data(ttl=1800, max_entries=2000)
 def news_data(ticker):
@@ -375,10 +403,21 @@ def main():
                 st.markdown("#### Last 30 trading days")
                 p=yahoo_chart(ticker,"2y")["df"].tail(30).sort_values("date",ascending=False).copy()
                 p["Change %"]=p["close"].pct_change(periods=-1)*100
-                st.dataframe(p.rename(columns={"date":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})[["Date","Open","High","Low","Close","Volume","Change %"]],hide_index=True,use_container_width=True)
+                p["Date"]=p["date"].dt.strftime("%Y-%m-%d")
+                p["Change %"]=p["Change %"].map(lambda v: "—" if pd.isna(v) else f"{v:.2f}%")
+                p=p.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+                st.dataframe(p[["Date","Open","High","Low","Close","Volume","Change %"]],hide_index=True,use_container_width=True)
                 st.markdown("#### Short availability")
                 s=x.get("short",pd.DataFrame())
-                st.dataframe(s.sort_values("reported",ascending=False) if not s.empty else pd.DataFrame({"Status":["Unavailable from public IBorrowDesk page"]}),hide_index=True,use_container_width=True)
+                if s.empty:
+                    st.warning("Short availability is currently unavailable from the public IBorrowDesk feed.")
+                else:
+                    sd=s.sort_values("reported",ascending=False).copy()
+                    sd["Reported"]=sd["reported"].dt.strftime("%Y-%m-%d %H:%M")
+                    sd["Borrow Fee"]=sd["fee"].map(lambda v: "—" if pd.isna(v) else f"{v:.2f}%")
+                    sd["Shares Available"]=sd["available"].map(lambda v: "—" if pd.isna(v) else f"{v:,.0f}")
+                    st.dataframe(sd[["Reported","Borrow Fee","Shares Available"]],hide_index=True,use_container_width=True)
+                    st.caption(f"IBorrowDesk readings loaded: {len(sd)}. Source: {IBD.format(ticker=ticker)}")
                 st.markdown("#### SEC events / News")
                 ev=x.get("sec_events",pd.DataFrame()); nw=x.get("news",pd.DataFrame())
                 if not ev.empty: st.dataframe(ev,use_container_width=True,hide_index=True)
