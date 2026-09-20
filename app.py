@@ -21,6 +21,7 @@ SEC_SUB = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 NASDAQ = "https://www.nasdaq.com/market-activity/stocks/non-compliant-company-list"
 IBD = "https://www.iborrowdesk.com/report/{ticker}"
+IBD_API = "https://www.iborrowdesk.com/api/ticker/{ticker}"
 
 STATUS_OK = "OK"
 STATUS_UNKNOWN = "UNKNOWN"
@@ -187,14 +188,55 @@ def shares_change(ticker):
 @st.cache_data(ttl=900, max_entries=2000)
 def iborrow(ticker):
     empty = pd.DataFrame(columns=["reported","fee","available"])
-    url = IBD.format(ticker=ticker.upper())
-    browser_headers = {**HEADERS, "User-Agent":"Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1", "Referer":url}
+    ticker = ticker.upper()
+    api_url = IBD_API.format(ticker=ticker)
+    page_url = IBD.format(ticker=ticker)
+    browser_headers = {
+        **HEADERS,
+        "User-Agent":"Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1",
+        "Referer":page_url,
+    }
+
+    def normalize_rows(records):
+        rows = []
+        if not isinstance(records, list):
+            return pd.DataFrame()
+        for r in records:
+            if not isinstance(r, dict):
+                continue
+            # Current/legacy IBorrowDesk API uses date/timestamp plus fee and available.
+            raw_dt = r.get("date") or r.get("reported") or r.get("timestamp") or r.get("time")
+            dt = pd.to_datetime(raw_dt, errors="coerce")
+            if pd.isna(dt):
+                continue
+            fee_v = num(r.get("fee"))
+            avail_v = human_num(r.get("available"))
+            if not np.isfinite(avail_v):
+                avail_v = num(r.get("available"))
+            if np.isfinite(fee_v) and np.isfinite(avail_v):
+                rows.append({"reported":dt, "fee":fee_v, "available":avail_v})
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows).drop_duplicates("reported").sort_values("reported").reset_index(drop=True)
+
+    # Prefer the site's data endpoint. The report page itself is sometimes
+    # client-rendered, so HTML scraping can return an empty page to Streamlit Cloud.
     try:
-        r = requests.get(url, headers=browser_headers, timeout=12)
+        r = requests.get(api_url, headers=browser_headers, timeout=12)
+        r.raise_for_status()
+        payload = r.json()
+        for key in ("real_time", "realtime", "daily"):
+            out = normalize_rows(payload.get(key, [])) if isinstance(payload, dict) else pd.DataFrame()
+            if not out.empty:
+                return {"status":STATUS_OK,"error":"","df":out.tail(31)}
+    except Exception:
+        pass
+
+    # Fallback: parse the public report page if the API is unavailable.
+    try:
+        r = requests.get(page_url, headers=browser_headers, timeout=12)
         r.raise_for_status()
         html = r.text
-        # The public page is sometimes rendered without a normal HTML table.
-        # Prefer read_html when available, then fall back to the visible row pattern.
         try:
             tables = pd.read_html(html)
         except Exception:
@@ -205,9 +247,11 @@ def iborrow(ticker):
             fee = next((c for k,c in cols.items() if "fee" in k),None)
             avail = next((c for k,c in cols.items() if "available" in k),None)
             if rep is not None and fee is not None and avail is not None:
-                out = pd.DataFrame({"reported":pd.to_datetime(t[rep],errors="coerce"),
-                                    "fee":t[fee].map(num),"available":t[avail].map(human_num)})
-                out = out.dropna(subset=["reported"]).sort_values("reported")
+                out = pd.DataFrame({
+                    "reported":pd.to_datetime(t[rep],errors="coerce"),
+                    "fee":t[fee].map(num),
+                    "available":t[avail].map(human_num)
+                }).dropna(subset=["reported"]).sort_values("reported")
                 if not out.empty:
                     return {"status":STATUS_OK,"error":"","df":out.tail(31)}
         text = re.sub(r"<[^>]+>", " ", html)
@@ -227,7 +271,7 @@ def iborrow(ticker):
         if rows:
             out = pd.DataFrame(rows).drop_duplicates("reported").sort_values("reported")
             return {"status":STATUS_OK,"error":"","df":out.tail(31).reset_index(drop=True)}
-        return {"status":STATUS_UNKNOWN,"error":"IBorrowDesk page returned no readable history","df":empty}
+        return {"status":STATUS_UNKNOWN,"error":"IBorrowDesk returned no readable borrow history","df":empty}
     except Exception as e:
         return {"status":STATUS_UNKNOWN,"error":str(e),"df":empty}
 
